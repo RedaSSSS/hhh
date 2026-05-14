@@ -1,21 +1,18 @@
 /**
  * ============================================================
- *  AIRBORNE RELAY — ESP32 Arduino Sketch
+ *  AIRBORNE RELAY — ESP32-S3 Arduino Sketch
  *  Search & Rescue Proof of Concept
  * ============================================================
  *  Mode    : AP + STA (simultaneous)
  *  AP SSID : RESCUE_NODE  (open, no password)
- *  STA     : Connects upstream to Pi 3 hotspot
- *  NAT     : Routes victim traffic → Pi 3 IP
+ *  STA     : Connects upstream to command network
+ *  NAT     : Routes victim traffic via ESP32 NAT
  *  Sniffer : Promiscuous mode probe-request harvester
- *  Report  : UDP packet to Pi 3 every 5 seconds
+ *  Report  : UDP packet to command server every 5 seconds
  * ============================================================
  *
- *  Required libraries (install via Arduino Library Manager):
- *    - arduino-esp32 (Espressif) v2.x+
- *    - lwip_napt patch (included in esp32 arduino >=2.0.2)
- *
- *  Board: "ESP32 Dev Module"
+ *  Board: "ESP32S3 Dev Module"
+ *  Arduino ESP32 board package v2.x+
  * ============================================================
  */
 
@@ -24,24 +21,32 @@
 #include <WiFiAP.h>
 #include <WiFiUdp.h>
 #include <esp_wifi.h>
-#include <esp_wifi_types.h>
-#include <lwip/lwip_napt.h>   // NAT/NAPT support
-#include <lwip/ip4_addr.h>
+#include "esp_netif.h"
+#include "lwip/ip_addr.h"
+
+// Try to include NAPT header — available on some ESP32 builds
+// If compilation fails here, NAPT will be disabled (sniffer still works)
+#if __has_include("lwip/lwip_napt.h")
+  #include "lwip/lwip_napt.h"
+  #define NAPT_AVAILABLE 1
+#elif __has_include("esp_netif_napt.h")
+  #include "esp_netif_napt.h"
+  #define NAPT_AVAILABLE 2
+#else
+  #define NAPT_AVAILABLE 0
+#endif
 
 // ─── CONFIG ──────────────────────────────────────────────────
-// Upstream network: the Pi 3 hotspot (STA side)
-const char* STA_SSID     = "PI_COMMAND_NET";   // Pi 3 hotspot SSID
-const char* STA_PASSWORD = "rescue2024";       // Pi 3 hotspot password
+// Upstream network (STA side) — the network your Pi/VM is on
+const char* STA_SSID     = "reda";             // Your Wi-Fi SSID
+const char* STA_PASSWORD = "";                 // Empty = open network
 
 // Victim-facing AP
 const char* AP_SSID      = "RESCUE_NODE";      // Open AP — no password
-const char* AP_IP        = "192.168.4.1";      // ESP32 AP gateway IP
-const char* AP_GATEWAY   = "192.168.4.1";
-const char* AP_SUBNET    = "255.255.255.0";
 
-// Command Server (Pi 3) address — on the STA subnet
-const char* PI_IP        = "10.0.0.1";         // Pi 3 IP on its own hotspot
-const uint16_t UDP_PORT  = 5005;               // UDP port Pi 3 listens on
+// Command Server address — your VM's IP
+const char* PI_IP        = "172.16.166.245";   // VM IP
+const uint16_t UDP_PORT  = 5005;               // UDP port server listens on
 
 // Sniffer report interval
 const unsigned long REPORT_INTERVAL_MS = 5000;
@@ -52,14 +57,14 @@ WiFiUDP udp;
 struct ProbeEntry {
   char mac[18];
   int8_t rssi;
-  unsigned long ts;  // millis() when seen
+  unsigned long ts;
 };
 
 // Ring buffer for captured probe entries
 static const int PROBE_BUF_SIZE = 64;
 static ProbeEntry probeBuf[PROBE_BUF_SIZE];
-static volatile int probeBufHead = 0;  // written by sniffer ISR-like callback
-static int probeBufTail = 0;           // read by main task
+static volatile int probeBufHead = 0;
+static int probeBufTail = 0;
 static portMUX_TYPE probeMux = portMUX_INITIALIZER_UNLOCKED;
 
 unsigned long lastReportMs = 0;
@@ -69,26 +74,13 @@ unsigned long lastReportMs = 0;
  * Wi-Fi promiscuous callback. Called for EVERY frame seen on-air.
  * We filter for Management frames (type=0) Probe Requests (subtype=4).
  *
- * 802.11 frame layout (simplified):
- *   Byte 0    : Frame Control byte 0  → [7:4]=subtype [3:2]=type [1:0]=protocol
- *   Byte 1    : Frame Control byte 1
- *   Bytes 4-9 : Destination MAC
- *   Bytes 10-15: Source MAC          ← victim device MAC
- *   ...
+ * 802.11 frame layout:
+ *   Byte 0    : Frame Control byte 0 -> [7:4]=subtype [3:2]=type
+ *   Bytes 10-15: Source MAC (victim device MAC)
  *
  * The esp32 SDK gives us wifi_promiscuous_pkt_t which prepends RSSI.
  */
-typedef struct {
-  uint8_t  frame_ctrl[2];
-  uint16_t duration;
-  uint8_t  dest[6];
-  uint8_t  src[6];    // ← Source MAC address
-  uint8_t  bssid[6];
-  uint16_t seq_ctrl;
-  // SSID element follows (variable)
-} ieee80211_mgmt_hdr_t;
-
-void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+void snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT) return;
 
   const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
@@ -121,30 +113,36 @@ void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
 
 // ─── HELPERS ─────────────────────────────────────────────────
 /**
- * Enable NAPT (Network Address Port Translation) on the AP interface.
- * This makes the ESP32 a NAT router: victims on 192.168.4.x get their
- * packets masqueraded and forwarded through the STA interface to Pi 3.
+ * Try to enable NAPT if available on this build.
+ * If not available, the ESP32 still works as a sniffer + AP,
+ * just without automatic NAT routing.
  */
 void enableNAPT() {
-  ip4_addr_t apIP, apGW, apNM;
-  IP4_ADDR(&apIP, 192, 168, 4, 1);
-  IP4_ADDR(&apGW, 192, 168, 4, 1);
-  IP4_ADDR(&apNM, 255, 255, 255, 0);
-
-  // Index 0 = STA (upstream), Index 1 = AP (downstream)
-  // Enable forwarding globally
-  ip_napt_enable(apIP.addr, 1);
-
-  Serial.println("[NAT] NAPT enabled on AP interface (192.168.4.1)");
+#if NAPT_AVAILABLE == 1
+  // Old-style lwip NAPT
+  ip_napt_enable_no(1, 1);  // netif index 1 = AP interface
+  Serial.println("[NAT] NAPT enabled (lwip method)");
+#elif NAPT_AVAILABLE == 2
+  // New esp-idf style NAPT
+  esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+  if (ap_netif) {
+    esp_netif_napt_enable(ap_netif);
+    Serial.println("[NAT] NAPT enabled (esp_netif method)");
+  } else {
+    Serial.println("[NAT] WARNING: Could not get AP netif handle");
+  }
+#else
+  Serial.println("[NAT] NAPT not available on this build - sniffer-only mode");
+  Serial.println("[NAT] Victims can connect to AP but traffic won't route automatically");
+  Serial.println("[NAT] This is OK for the probe-sniffer demo!");
+#endif
 }
 
 /**
- * Build a compact JSON-like UDP payload from the probe ring buffer.
+ * Send probe report via UDP.
  * Format: MAC|RSSI\nMAC|RSSI\n...
- * Kept lightweight — Pi 3 parses it line by line.
  */
 void sendProbeReport() {
-  // Drain the ring buffer into a local snapshot
   String payload = "";
   int count = 0;
 
@@ -157,9 +155,9 @@ void sendProbeReport() {
   }
   portEXIT_CRITICAL(&probeMux);
 
-  if (count == 0) return;  // Nothing to report
+  if (count == 0) return;
 
-  Serial.printf("[SNIFFER] Sending %d probe entries to Pi 3\n", count);
+  Serial.printf("[SNIFFER] Sending %d probe entries to server\n", count);
 
   udp.beginPacket(PI_IP, UDP_PORT);
   udp.print(payload);
@@ -169,11 +167,12 @@ void sendProbeReport() {
 // ─── SETUP ───────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n\n=== AIRBORNE RELAY BOOT ===");
+  delay(1000);  // Give S3 time to initialize USB-CDC
+  Serial.println("\n\n=== AIRBORNE RELAY BOOT (ESP32-S3) ===");
 
   // ── 1. Set Wi-Fi to AP+STA mode ──────────────────────────
   WiFi.mode(WIFI_AP_STA);
+  delay(100);
 
   // ── 2. Configure and start the victim-facing AP ──────────
   IPAddress apLocalIP(192, 168, 4, 1);
@@ -181,12 +180,16 @@ void setup() {
   IPAddress apSubnet(255, 255, 255, 0);
 
   WiFi.softAPConfig(apLocalIP, apGateway, apSubnet);
-  WiFi.softAP(AP_SSID);   // Open AP — no password argument
+  WiFi.softAP(AP_SSID);   // Open AP — no password
   Serial.printf("[AP] SSID='%s' IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
-  // ── 3. Connect STA to Pi 3 hotspot ───────────────────────
+  // ── 3. Connect STA to upstream network ────────────────────
   Serial.printf("[STA] Connecting to '%s'...\n", STA_SSID);
-  WiFi.begin(STA_SSID, STA_PASSWORD);
+  if (strlen(STA_PASSWORD) > 0) {
+    WiFi.begin(STA_SSID, STA_PASSWORD);
+  } else {
+    WiFi.begin(STA_SSID);  // Open network — no password
+  }
 
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 30) {
@@ -198,10 +201,10 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("\n[STA] Connected! IP=%s\n", WiFi.localIP().toString().c_str());
   } else {
-    Serial.println("\n[STA] WARNING: Could not connect to Pi 3. Relay in offline mode.");
+    Serial.println("\n[STA] WARNING: Could not connect. Sniffer-only mode.");
   }
 
-  // ── 4. Enable NAPT ───────────────────────────────────────
+  // ── 4. Enable NAPT (if available) ────────────────────────
   enableNAPT();
 
   // ── 5. Start UDP socket ───────────────────────────────────
@@ -209,10 +212,6 @@ void setup() {
   Serial.printf("[UDP] Socket open on port %d\n", UDP_PORT);
 
   // ── 6. Enable Wi-Fi Promiscuous Sniffer ──────────────────
-  //  IMPORTANT: promiscuous mode works on the current Wi-Fi channel.
-  //  The ESP32 will sniff on the channel it's associated to (STA channel).
-  //  For broader coverage in a real deployment, you'd hop channels,
-  //  but for PoC this captures probes near the drone's operating channel.
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
   Serial.println("[SNIFFER] Promiscuous mode enabled. Capturing probe requests.");
@@ -235,6 +234,6 @@ void loop() {
     }
   }
 
-  // Brief yield — sniffer callback runs in wifi driver context
+  // Yield to system tasks
   delay(10);
 }
