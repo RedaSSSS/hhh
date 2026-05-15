@@ -1,6 +1,6 @@
 /**
  * ============================================================
- *  AIRBORNE RELAY — ESP32-S3 (Full Version)
+ *  AIRBORNE RELAY — ESP32-S3 (Full Version - HTTP)
  *  Search & Rescue Proof of Concept
  * ============================================================
  *  Board: "ESP32S3 Dev Module"
@@ -11,19 +11,17 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiAP.h>
-#include <WiFiUdp.h>
+#include <WiFiClient.h>
 #include <esp_wifi.h>
 
 // ─── CONFIG ──────────────────────────────────────────────────
 const char* STA_SSID     = "reda";
 const char* AP_SSID      = "RESCUE_NODE";
-const char* PI_IP        = "192.168.1.116";
+const char* PI_IP        = "172.16.166.245";
 const uint16_t UDP_PORT  = 5005;
 const unsigned long REPORT_INTERVAL_MS = 5000;
 
 // ─── GLOBALS ─────────────────────────────────────────────────
-WiFiUDP udp;
-
 struct ProbeEntry {
   char mac[18];
   int8_t rssi;
@@ -85,7 +83,7 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("\n[STA] Connected! IP=%s\n", WiFi.localIP().toString().c_str());
   } else {
-    Serial.println("\n[STA] WARNING: Not connected. Will work in sniffer-only mode.");
+    Serial.println("\n[STA] WARNING: Not connected.");
   }
 
   // Step 2: Start AP
@@ -101,11 +99,7 @@ void setup() {
   WiFi.softAP(AP_SSID);
   Serial.printf("[AP] SSID='%s' IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
-  // Step 3: Start UDP
-  udp.begin(UDP_PORT);
-  Serial.printf("[UDP] Ready on port %d\n", UDP_PORT);
-
-  // Step 4: Start sniffer
+  // Step 3: Start sniffer
   delay(1000);
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
@@ -141,10 +135,24 @@ void loop() {
       for (int i = 0; i < count; i++) {
         payload += String(localBuf[i].mac) + "|" + String(localBuf[i].rssi) + "\n";
       }
-      udp.beginPacket(PI_IP, UDP_PORT);
-      udp.print(payload);
-      udp.endPacket();
-      Serial.printf("[SENT] %d probes to server\n", count);
+
+      // Send via HTTP POST
+      WiFiClient client;
+      if (client.connect(PI_IP, 80)) {
+        client.println("POST /api/probes HTTP/1.1");
+        client.print("Host: ");
+        client.println(PI_IP);
+        client.println("Content-Type: text/plain");
+        client.print("Content-Length: ");
+        client.println(payload.length());
+        client.println();
+        client.print(payload);
+        delay(100);
+        client.stop();
+        Serial.printf("[SENT] %d probes via HTTP\n", count);
+      } else {
+        Serial.println("[ERR] HTTP connect failed");
+      }
     } else if (count > 0) {
       Serial.printf("[LOCAL] %d probes (no connection)\n", count);
       for (int i = 0; i < count && i < 5; i++) {
