@@ -511,16 +511,16 @@ SOS_HTML_PAGE = """<!DOCTYPE html>
 
 <!-- ═══════════════════════════════════════════════════════════════
      JsSIP WebRTC VoIP Stack
-     JsSIP 3.10.0 — loaded from CDN
+     JsSIP 3.1.1 — loaded from CDN
      ═══════════════════════════════════════════════════════════════ -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jssip/3.10.0/jssip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jssip/3.1.1/jssip.min.js"></script>
 <script>
 // ────────────────────────────────────────────────────────────────
 //  WebRTC / JsSIP Configuration
 // ────────────────────────────────────────────────────────────────
 
 const PI_HOST     = window.location.hostname;
-const PI_WS_URL   = "wss://" + PI_HOST + ":8089/ws";
+const PI_WS_URL   = "ws://" + PI_HOST + ":8088/ws";
 const SIP_USER    = "200";
 const SIP_PASS    = "victim200pass";
 const SIP_REALM   = PI_HOST;
