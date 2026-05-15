@@ -510,171 +510,110 @@ SOS_HTML_PAGE = """<!DOCTYPE html>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════
-     SIP.js WebRTC VoIP Stack
-     SIP.js 0.21.x — loaded from CDN
+     JsSIP WebRTC VoIP Stack
+     JsSIP 3.10.0 — loaded from CDN
      ═══════════════════════════════════════════════════════════════ -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/sip.js/0.21.2/sip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jssip/3.10.0/jssip.min.js"></script>
 <script>
 // ────────────────────────────────────────────────────────────────
-//  WebRTC / SIP.js Configuration
-//
-//  The victim's browser connects to Asterisk on the Pi 3 via WebSocket.
-//  Asterisk acts as both the SIP registrar and the WebRTC media relay.
-//
-//  SDP Negotiation flow (simplified):
-//    Browser → WS INVITE → Asterisk → SIP INVITE → Ext. 100 softphone
-//    Softphone ← SIP 200 OK + SDP ← Asterisk
-//    Browser ← WS 200 OK + SDP ← Asterisk
-//    Browser ←─ RTP/SRTP media ──→ Asterisk ←─ RTP ──→ Softphone
-//
-//  NOTE: Update PI_WS_URL to your Pi 3's actual IP address.
+//  WebRTC / JsSIP Configuration
 // ────────────────────────────────────────────────────────────────
 
-const PI_WS_URL   = "wss://10.0.0.1:8089/ws";  // Asterisk WebSocket (TLS)
-const SIP_USER    = "200";                       // Victim WebRTC extension
-const SIP_PASS    = "victim200pass";             // Must match pjsip.conf
-const SIP_REALM   = "10.0.0.1";                 // Asterisk server domain
-const CALL_TARGET = "100";                       // Command Desk extension
+const PI_HOST     = window.location.hostname;
+const PI_WS_URL   = "wss://" + PI_HOST + ":8089/ws";
+const SIP_USER    = "200";
+const SIP_PASS    = "victim200pass";
+const SIP_REALM   = PI_HOST;
+const CALL_TARGET = "100";
 
-let userAgent   = null;
+let userAgent     = null;
 let activeSession = null;
-let isRegistered  = false;
 
-// ── Initialise SIP User Agent ─────────────────────────────────
 function initSIP() {
-  const transportOptions = {
-    server: PI_WS_URL,
-    traceSip: false,
+  const socket = new JsSIP.WebSocketInterface(PI_WS_URL);
+  const configuration = {
+    sockets: [socket],
+    uri: "sip:" + SIP_USER + "@" + SIP_REALM,
+    password: SIP_PASS,
+    register: true
   };
 
-  const uri = SIP.UserAgent.makeURI(`sip:${SIP_USER}@${SIP_REALM}`);
+  userAgent = new JsSIP.UA(configuration);
 
-  userAgent = new SIP.UserAgent({
-    uri:              uri,
-    transportOptions: transportOptions,
-    authorizationUsername: SIP_USER,
-    authorizationPassword: SIP_PASS,
+  userAgent.on("connected",    () => setStatus("WS CONNECTED — REGISTERING...", "active"));
+  userAgent.on("disconnected", () => setStatus("WS DISCONNECTED", "error"));
+  userAgent.on("registered",   () => setStatus("REGISTERED — READY TO CALL", "active"));
+  userAgent.on("registrationFailed", (e) => setStatus("REGISTER FAILED: " + e.cause, "error"));
 
-    // ICE / NAT traversal configuration.
-    // In this local LAN setup, STUN is optional but included for completeness.
-    // For real deployments behind NAT, add a TURN server here.
-    sessionDescriptionHandlerFactoryOptions: {
-      peerConnectionConfiguration: {
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" }
-        ]
-      }
-    },
-
-    logLevel: "error",
-  });
-
-  // Register with Asterisk so Asterisk knows we exist
-  const registerer = new SIP.Registerer(userAgent);
-
-  userAgent.start().then(() => {
-    registerer.register();
-    isRegistered = true;
-    setStatus("REGISTERED WITH PBX — READY TO CALL", "active");
-  }).catch(err => {
-    setStatus("PBX CONNECTION FAILED: " + err.message, "error");
-  });
-
-  return { userAgent, registerer };
+  userAgent.start();
 }
 
-// ── Place a Call ─────────────────────────────────────────────
 function placeCall() {
-  if (!userAgent || !isRegistered) {
-    setStatus("ERROR: NOT REGISTERED WITH PBX", "error");
+  if (!userAgent || !userAgent.isRegistered()) {
+    setStatus("ERROR: NOT REGISTERED", "error");
     return;
   }
 
-  const targetURI = SIP.UserAgent.makeURI(`sip:${CALL_TARGET}@${SIP_REALM}`);
-
-  const inviter = new SIP.Inviter(userAgent, targetURI, {
-    sessionDescriptionHandlerOptions: {
-      constraints: {
-        audio: true,
-        video: false   // Audio-only — conserves bandwidth over drone relay
-      }
+  const eventHandlers = {
+    progress:  () => {
+      setStatus("CALLING... RINGING", "active");
+      document.getElementById("call-btn").textContent = "CALLING...";
+      document.getElementById("call-btn").className = "btn btn-call calling";
+    },
+    failed:    (e) => {
+      setStatus("CALL FAILED: " + e.cause, "error");
+      resetCallButton();
+    },
+    ended:     () => {
+      setStatus("CALL ENDED", "");
+      resetCallButton();
+    },
+    confirmed: () => {
+      setStatus("CALL CONNECTED", "active");
+      document.getElementById("call-btn").textContent = "END CALL";
+      document.getElementById("call-btn").onclick = endCall;
     }
-  });
+  };
 
-  // ── Session State Machine ─────────────────────────────────
-  inviter.stateChange.addListener((state) => {
-    switch (state) {
-      case SIP.SessionState.Establishing:
-        setStatus("CALLING COMMAND CENTER... RINGING", "active");
-        document.getElementById("call-btn").textContent = "⏳ CALLING...";
-        document.getElementById("call-btn").className  = "btn btn-call calling";
-        break;
-
-      case SIP.SessionState.Established:
-        setStatus("CALL CONNECTED ✓", "active");
-        document.getElementById("call-btn").textContent = "✕ END CALL";
-        document.getElementById("call-btn").onclick     = endCall;
-
-        // Attach remote audio stream to the <audio> element
-        attachRemoteAudio(inviter);
-        break;
-
-      case SIP.SessionState.Terminated:
-        setStatus("CALL ENDED", "");
-        resetCallButton();
-        break;
+  const options = {
+    eventHandlers: eventHandlers,
+    mediaConstraints: { audio: true, video: false },
+    pcConfig: {
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
     }
-  });
+  };
 
-  inviter.invite().catch(err => {
-    setStatus("CALL FAILED: " + err.message, "error");
-    resetCallButton();
-  });
+  activeSession = userAgent.call("sip:" + CALL_TARGET + "@" + SIP_REALM, options);
 
-  activeSession = inviter;
+  activeSession.connection.addEventListener("addstream", (e) => {
+    const audioEl = document.getElementById("remote-audio");
+    audioEl.srcObject = e.stream;
+    audioEl.play().catch(err => console.warn("Audio play blocked:", err));
+  });
 }
 
-// ── Attach remote RTP stream to DOM audio element ─────────────
-function attachRemoteAudio(session) {
-  const audioEl = document.getElementById("remote-audio");
-
-  session.sessionDescriptionHandler.peerConnection
-    .getReceivers()
-    .forEach(receiver => {
-      if (receiver.track && receiver.track.kind === "audio") {
-        const remoteStream = new MediaStream([receiver.track]);
-        audioEl.srcObject = remoteStream;
-        audioEl.play().catch(e => console.warn("Audio play blocked:", e));
-      }
-    });
-}
-
-// ── End Active Call ───────────────────────────────────────────
 function endCall() {
   if (activeSession) {
-    activeSession.bye();
+    activeSession.terminate();
     activeSession = null;
   }
   resetCallButton();
   setStatus("CALL TERMINATED", "");
 }
 
-// ── UI Helpers ────────────────────────────────────────────────
 function setStatus(msg, cls) {
   const el = document.getElementById("call-status");
-  el.textContent  = msg;
-  el.className    = cls;
+  el.textContent = msg;
+  el.className = cls;
 }
 
 function resetCallButton() {
   const btn = document.getElementById("call-btn");
-  btn.textContent = "☎ CALL COMMAND CENTER (EXT. 100)";
-  btn.className   = "btn btn-call";
-  btn.onclick     = handleCallButton;
+  btn.textContent = "CALL COMMAND CENTER (EXT. 100)";
+  btn.className = "btn btn-call";
+  btn.onclick = handleCallButton;
 }
 
-// ── Entry Point ───────────────────────────────────────────────
-// Initialise SIP on first user interaction (browser autoplay policy)
 let sipInitialised = false;
 
 function handleCallButton() {
@@ -682,8 +621,7 @@ function handleCallButton() {
     sipInitialised = true;
     setStatus("CONNECTING TO PBX...", "active");
     initSIP();
-    // Wait a moment for registration before placing the call
-    setTimeout(placeCall, 2500);
+    setTimeout(placeCall, 3000);
   } else {
     placeCall();
   }
