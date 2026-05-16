@@ -38,7 +38,7 @@ from flask import Flask, request, redirect, jsonify, g
 DB_PATH       = "/var/db/rescue.db"       # Persistent database path
 UDP_LISTEN_IP = "0.0.0.0"
 UDP_PORT      = 5005
-FLASK_PORT    = 80                        # Use 8080 if not running as root
+FLASK_PORT    = 443                        # Use 8080 if not running as root
 PI_AP_IP      = "10.0.0.1"               # Pi 3's own IP on its hotspot network
                                           # Change to match your Pi's actual IP
 
@@ -621,7 +621,7 @@ function handleCallButton() {
     sipInitialised = true;
     setStatus("CONNECTING TO PBX...", "active");
     initSIP();
-    setTimeout(placeCall, 3000);
+    setTimeout(placeCall, 6000);
   } else {
     placeCall();
   }
@@ -744,5 +744,5 @@ if __name__ == "__main__":
         port=args.port,
         threaded=True,
         debug=False,
-        ssl_context=None,   # Set to ('cert.pem','key.pem') to enable HTTPS
+        ssl_context=('/home/reda/hhh/cert.pem', '/home/reda/hhh/key.pem'),   # Set to ('cert.pem','key.pem') to enable HTTPS
     )
